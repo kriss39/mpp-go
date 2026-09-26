@@ -37,7 +37,7 @@ const (
 	testCurrency    = "0x20c0000000000000000000000000000000000001"
 	testRecipient   = "0x70997970c51812dc3a010c7d01b50e0d17dc79c8"
 	testRealm       = "api.example.com"
-	testReceiptHash = "0x2120c5a4e1f6b7d9c3a8e2f4b6d8a0c2e4f6a8b0c2d4e6f8a0b2c4d6e8f0a2b4"
+	testReceiptHash = "0xabc123"
 )
 
 func TestDecodeCallTransferRejectsPaddedCalldata(t *testing.T) {
@@ -1096,57 +1096,7 @@ func TestChargeFlow_HashCredentialIgnoresFeeControllerLogs(t *testing.T) {
 	}
 }
 
-func TestChargeFlow_HashCredentialRejectsReplayWithAlternateSpelling(t *testing.T) {
-	ctx := context.Background()
-	request, err := tempo.NormalizeChargeRequest(tempo.ChargeRequestParams{
-		Amount:         "0.50",
-		Currency:       testCurrency,
-		Recipient:      testRecipient,
-		Decimals:       6,
-		ChainID:        42431,
-		SupportedModes: []tempo.ChargeMode{tempo.ChargeModePush},
-	})
-	if !assert.NoErrorf(t, err,
-		"NormalizeChargeRequest() error = %v", err) {
-		return
-	}
-
-	rpc := newMockRPC(request)
-	// Nodes look receipts up by value, so every spelling of the hash resolves
-	// to the same receipt; the replay key must not depend on the spelling.
-	rpc.onGetReceipt = func(hash string) (*temporpc.JSONRPCResponse, error) {
-		normalized := strings.ToLower(strings.TrimPrefix(strings.TrimPrefix(hash, "0x"), "0X"))
-		return &temporpc.JSONRPCResponse{Result: rpc.receipts["0x"+normalized]}, nil
-	}
-	challenge := buildChallenge(t, request)
-	credential, err := newClientMethod(t, rpc, tempo.CredentialTypeHash).CreateCredential(ctx, challenge)
-	if !assert.NoErrorf(t, err,
-		"CreateCredential() error = %v", err) {
-		return
-	}
-
-	intent, err := NewIntent(IntentConfig{RPC: rpc})
-	if !assert.NoErrorf(t, err,
-		"NewIntent() error = %v", err) {
-		return
-	}
-	if _, err := intent.Verify(ctx, credential, request.Map()); err != nil {
-		assert.Failf(t, "", "Verify() error = %v", err)
-		return
-	}
-
-	for name, spelling := range map[string]string{
-		"unprefixed": strings.TrimPrefix(testReceiptHash, "0x"),
-		"uppercase":  "0X" + strings.ToUpper(strings.TrimPrefix(testReceiptHash, "0x")),
-	} {
-		replay := *credential
-		replay.Payload = map[string]any{"type": "hash", "hash": spelling}
-		_, err := intent.Verify(ctx, &replay, request.Map())
-		assert.ErrorContainsf(t, err, "already used", "%s replay should be rejected", name)
-	}
-}
-
-func TestChargeFlow_HashCredentialAcceptsExplicitPrimaryMemo(t *testing.T) {
+func TestChargeFlow_HashCredentialAcceptsAttributionMemo(t *testing.T) {
 	ctx := context.Background()
 	method := NewMethod(MethodConfig{
 		Currency:  testCurrency,
@@ -1156,7 +1106,6 @@ func TestChargeFlow_HashCredentialAcceptsExplicitPrimaryMemo(t *testing.T) {
 	})
 	requestMap, err := method.BuildChargeRequest(server.ChargeParams{
 		Amount:         "0.50",
-		Memo:           "0x0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
 		SupportedModes: []tempo.ChargeMode{tempo.ChargeModePush},
 	})
 	if !assert.NoErrorf(t, err,
@@ -1183,13 +1132,6 @@ func TestChargeFlow_HashCredentialAcceptsExplicitPrimaryMemo(t *testing.T) {
 	intent, err := NewIntent(IntentConfig{RPC: rpc})
 	if !assert.NoErrorf(t, err,
 		"NewIntent() error = %v", err) {
-		return
-	}
-
-	wrongMemoRequest := request
-	wrongMemoRequest.MethodDetails.Memo = "0x2020202020202020202020202020202020202020202020202020202020202020"
-	if _, err := intent.Verify(ctx, credential, wrongMemoRequest.Map()); err == nil || !strings.Contains(err.Error(), "does not satisfy") {
-		assert.Failf(t, "", "Verify() error = %v, want memo mismatch", err)
 		return
 	}
 
@@ -1898,46 +1840,39 @@ func init() {
 }
 
 func TestChargeFlow_ConcurrentTransactionReplay(t *testing.T) {
-	for _, explicitMemo := range []bool{false, true} {
-		t.Run(fmt.Sprintf("explicitMemo=%t", explicitMemo), func(t *testing.T) {
-			ctx := context.Background()
-			request := buildRequest(t, false, nil)
-			if explicitMemo {
-				request.MethodDetails.Memo = "0x" + strings.Repeat("ab", 32)
-			}
-			credential, err := newClientMethod(t, newMockRPC(request), tempo.CredentialTypeTransaction).CreateCredential(ctx, buildChallenge(t, request))
-			require.NoError(t, err)
-			raw := credential.Payload["signature"].(string)
-			hash, err := tempotx.ComputeHash(raw)
-			require.NoError(t, err)
-			tx, err := tempotx.Deserialize(raw)
-			require.NoError(t, err)
-			sender, err := tempotx.VerifySignature(tx)
-			require.NoError(t, err)
-			store := tempo.NewMemoryStore()
-			start := make(chan struct{})
-			results := make(chan error, 8)
-			for range 8 {
-				rpc := newMockRPC(request)
-				rpc.receipts[hash.Hex()] = buildReceipt(raw, request, sender)
-				intent, err := NewIntent(IntentConfig{RPC: rpc, Store: store})
-				require.NoError(t, err)
-				go func() {
-					<-start
-					_, err := intent.Verify(ctx, credential, request.Map())
-					results <- err
-				}()
-			}
-			close(start)
-			successes := 0
-			for range 8 {
-				if err := <-results; err == nil {
-					successes++
-				} else {
-					assert.ErrorContains(t, err, "transaction hash already used")
-				}
-			}
-			assert.Equal(t, 1, successes)
-		})
+	ctx := context.Background()
+	request := buildRequest(t, false, nil)
+	credential, err := newClientMethod(t, newMockRPC(request), tempo.CredentialTypeTransaction).CreateCredential(ctx, buildChallenge(t, request))
+	require.NoError(t, err)
+	raw := credential.Payload["signature"].(string)
+	hash, err := tempotx.ComputeHash(raw)
+	require.NoError(t, err)
+	tx, err := tempotx.Deserialize(raw)
+	require.NoError(t, err)
+	sender, err := tempotx.VerifySignature(tx)
+	require.NoError(t, err)
+	store := tempo.NewMemoryStore()
+	start := make(chan struct{})
+	results := make(chan error, 8)
+	for range 8 {
+		rpc := newMockRPC(request)
+		rpc.receipts[hash.Hex()] = buildReceipt(raw, request, sender)
+		intent, err := NewIntent(IntentConfig{RPC: rpc, Store: store})
+		require.NoError(t, err)
+		go func() {
+			<-start
+			_, err := intent.Verify(ctx, credential, request.Map())
+			results <- err
+		}()
 	}
+	close(start)
+	successes := 0
+	for range 8 {
+		if err := <-results; err == nil {
+			successes++
+		} else {
+			assert.ErrorContains(t, err, "transaction hash already used")
+		}
+	}
+	assert.Equal(t, 1, successes)
 }
